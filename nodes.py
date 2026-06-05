@@ -150,15 +150,116 @@ class TASSRoPEPatcher:
         
         return (patched_model,)
 
+class STDRCThreeStreamGuider:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive_text": ("CONDITIONING",),
+                "positive_reference": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "cfg": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "reference_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 10.0, "step": 0.05}),
+            }
+        }
+
+    RETURN_TYPES = ("GUIDER",)
+    FUNCTION = "setup_guider"
+    CATEGORY = "ST-DRC/Sampling"
+
+    def setup_guider(self, model, positive_text, positive_reference, negative, cfg, reference_scale):
+        # We define an internal custom guider class that ComfyUI's SamplerCustomAdvanced can read natively
+        class ThreeStreamGuider:
+            def __init__(self, model, pos_text, pos_ref, neg, cfg_scale, ref_scale):
+                self.model = model
+                self.pos_text = pos_text
+                self.pos_ref = pos_ref
+                self.neg = neg
+                self.cfg_scale = cfg_scale
+                self.ref_scale = ref_scale
+
+            def __call__(self, x, timestep, **kwargs):
+                # This inner function executes at every single denoising step
+                # x is the current noisy latent tensor string
+                
+                # 1. Run model prediction across all three conditional embedding targets
+                # We fetch velocity or noise predictions by passing each conditioning branch
+                out_text = self.model.apply_model(x, timestep, cond=self.pos_text, **kwargs)
+                out_ref = self.model.apply_model(x, timestep, cond=self.pos_ref, **kwargs)
+                out_neg = self.model.apply_model(x, timestep, cond=self.neg, **kwargs)
+                
+                # 2. Extract the mathematical direction vectors
+                # Vector component pulling toward text alignment
+                text_direction = out_text - out_neg
+                
+                # Vector component pulling toward identity reference alignment
+                ref_direction = out_ref - out_neg
+                
+                # 3. Recombine using independent scaling variables matching the ST-DRC paper
+                # Base Unconditional Noise + (Text_Scale * Text_Vector) + (Ref_Scale * Ref_Vector)
+                final_velocity = out_neg + (self.cfg_scale * text_direction) + (self.ref_scale * ref_direction)
+                
+                return final_velocity
+
+            def clone(self):
+                return ThreeStreamGuider(self.model, self.pos_text, self.pos_ref, self.neg, self.cfg_scale, self.ref_scale)
+
+        # Instantiate our custom guider class and wrap it inside the standard ComfyUI structure
+        guider_instance = ThreeStreamGuider(model, positive_text, positive_reference, negative, cfg, reference_scale)
+        
+        return (guider_instance,)
+
+class STDRCLatentTrimmer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "extended_latent": ("LATENT",),
+                "reference_frames": ("INT", {"default": 1, "min": 1, "max": 64}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("trimmed_latent",)
+    FUNCTION = "trim_context"
+    CATEGORY = "ST-DRC/Post-Processing"
+
+    def trim_context(self, extended_latent, reference_frames):
+        samples = extended_latent["samples"].clone() # Shape: [B, C, F_total, H, W]
+        
+        # Slice off the prefix reference frames along the temporal axis (dim=2)
+        # We start extracting from 'reference_frames' index all the way to the end
+        trimmed_samples = samples[:, :, reference_frames:, :, :]
+        
+        new_latent_dict = {
+            "samples": trimmed_samples,
+            "type": "video"
+        }
+        
+        # Clean up the noise mask tracking if one was present
+        if "noise_mask" in extended_latent:
+            orig_mask = extended_latent["noise_mask"]
+            new_latent_dict["noise_mask"] = orig_mask[:, :, reference_frames:, :, :]
+
+        return (new_latent_dict,)
+
+
+# --- STRICT ST-DRC REGISTRATION MAPPINGS ---
 
 # --- STRICT ST-DRC REGISTRATION MAPPINGS ---
 
 NODE_CLASS_MAPPINGS = {
     "STDRCContextInjector": STDRCContextInjector,
-    "TASSRoPEPatcher": TASSRoPEPatcher, # REGISTER NEW PATCHER
+    "TASSRoPEPatcher": TASSRoPEPatcher,
+    "STDRCThreeStreamGuider": STDRCThreeStreamGuider,
+    "STDRCLatentTrimmer": STDRCLatentTrimmer, 
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "STDRCContextInjector": "ST-DRC Context Latent Injector (Pine)",
-    "TASSRoPEPatcher": "ST-DRC TASS-RoPE Patcher (Pine)", # REGISTER DISPLAY NAME
+    "TASSRoPEPatcher": "ST-DRC TASS-RoPE Patcher (Pine)",
+    "STDRCThreeStreamGuider": "ST-DRC CFG Guider (Pine)",
+    "STDRCLatentTrimmer": "ST-DRC Latent Trimmer (Pine)",
 }
+
