@@ -1,0 +1,9 @@
+# Ignore Python bytecode cache directories
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Optional: Ignore operating system junk files
+.DS_Store
+Thumbs.db
