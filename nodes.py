@@ -1,8 +1,6 @@
 import torch
 import torch.nn.functional as F
 import random
-import inspect
-import copy
 import comfy.samplers
 
 class STDRCContextInjector:
@@ -107,42 +105,78 @@ class STDRCThreeStreamGuider:
     CATEGORY = "ST-DRC/Sampling"
 
     @classmethod
-    def IS_CHANGED(s, **kwargs): return random.random()
+    def IS_CHANGED(s, **kwargs):
+        return random.random()
 
     def setup_guider(self, model, positive_text, positive_reference, negative, cfg, reference_scale):
-        class ThreeStreamGuider:
-            def __init__(self, model_patcher, pos_text, pos_ref, neg, cfg, ref_scale):
+        model_patched = model.clone()
+
+        class ThreeStreamGuider(object):
+            def __init__(self, model_patcher):
                 self.model_patcher = model_patcher
-                self.pos_text, self.pos_ref, self.neg = pos_text, pos_ref, neg
-                self.cfg_scale, self.ref_scale = cfg, ref_scale
+                self.inner_model = model_patcher.model
+                self.pos_text = positive_text
+                self.pos_ref = positive_reference
+                self.neg = negative
+                self.cfg_scale = cfg
+                self.ref_scale = reference_scale
 
             def sample(self, noise, latent_image, sampler, sigmas, denoise_mask=None, callback=None, disable_pbar=False, seed=None):
-                target_model = self.model_patcher.model.diffusion_model if hasattr(self.model_patcher.model, "diffusion_model") else self.model_patcher.model
+                compute_device = getattr(self.model_patcher, "load_device", torch.device("cuda"))
+                target_model = getattr(self.inner_model, "diffusion_model", self.inner_model)
                 original_forward = target_model.forward
 
+                def to_tensor(val):
+                    # If the model returns a list/tuple (common with custom patchers), 
+                    # extract the first element, which is the primary latent output.
+                    if isinstance(val, (list, tuple)):
+                        return val[0]
+                    return val
+
                 def custom_dit_forward(x, timesteps, context, *args, **kwargs):
-                    if context.shape[0] != 2: return original_forward(x, timesteps, context, *args, **kwargs)
+                    if context.shape[0] < 2:
+                        return original_forward(x, timesteps, context, *args, **kwargs)
+
+                    cond_text = context[0:1]
+                    cond_uncond = context[1:2]
+                    cond_ref = cond_text.clone()
+
+                    out_text = to_tensor(original_forward(x, timesteps, cond_text, *args, **kwargs))
+                    out_ref = to_tensor(original_forward(x, timesteps, cond_ref, *args, **kwargs))
+                    out_neg = to_tensor(original_forward(x, timesteps, cond_uncond, *args, **kwargs))
+
+                    text_dir = out_text - out_neg
+                    ref_dir = out_ref - out_neg
                     
-                    def make_batch_one(data, idx):
-                        if torch.is_tensor(data) and data.shape[0] == 2 and data.dim() > 1: return data[idx:idx+1]
-                        if isinstance(data, list): return [make_batch_one(item, idx) for item in data]
-                        return data
-
-                    out_text = original_forward(x[0:1], timesteps[0:1], context[0:1], *args, **{k: make_batch_one(v, 0) for k, v in kwargs.items()})
-                    out_ref = original_forward(x[0:1], timesteps[0:1], context[0:1], *args, **{k: make_batch_one(v, 0) for k, v in kwargs.items()})
-                    out_neg = original_forward(x[1:2], timesteps[1:2], context[1:2], *args, **{k: make_batch_one(v, 1) for k, v in kwargs.items()})
-
-                    text_dir, ref_dir = out_text - out_neg, out_ref - out_neg
-                    mixed = out_neg + (self.cfg_scale * text_dir) + (self.ref_scale * ref_dir)
-                    return torch.cat([mixed, mixed], dim=0)
+                    return out_neg + (self.cfg_scale * text_dir) + (self.ref_scale * ref_dir)
 
                 target_model.forward = custom_dit_forward
                 try:
-                    return comfy.samplers.sample(self.model_patcher, noise, self.pos_text, self.neg, 1.0, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed)
+                    return comfy.samplers.sample(
+                        model=self.model_patcher,
+                        noise=noise,
+                        positive=self.pos_text,
+                        negative=self.neg,
+                        cfg=1.0, 
+                        latent_image=latent_image,
+                        sampler=sampler,
+                        sigmas=sigmas,
+                        denoise_mask=denoise_mask,
+                        callback=callback,
+                        disable_pbar=disable_pbar,
+                        seed=seed,
+                        device=compute_device
+                    )
                 finally:
                     target_model.forward = original_forward
 
-        return (ThreeStreamGuider(model.clone(), positive_text, positive_reference, negative, cfg, reference_scale),)
+            def predict_noise(self, x, timestep, model_options={}, seed=None):
+                return x
+
+            def clone(self):
+                return ThreeStreamGuider(self.model_patcher)
+
+        return (ThreeStreamGuider(model_patched),)
 
 NODE_CLASS_MAPPINGS = {
     "STDRCContextInjector": STDRCContextInjector,
