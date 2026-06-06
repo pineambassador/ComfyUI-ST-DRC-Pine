@@ -1,5 +1,7 @@
 import torch
 import torch.nn.functional as F
+import random
+import comfy.samplers
 
 class STDRCContextInjector:
     @classmethod
@@ -7,7 +9,7 @@ class STDRCContextInjector:
         return {
             "required": {
                 "latent_video": ("LATENT",),
-                "reference_face": ("LATENT",),
+                "reference_image": ("IMAGE",),
                 "scaling_correction": ("BOOLEAN", {"default": True}),
             }
         }
@@ -17,24 +19,33 @@ class STDRCContextInjector:
     FUNCTION = "inject_context"
     CATEGORY = "ST-DRC/Preparation"
 
-    def inject_context(self, latent_video, reference_face, scaling_correction):
-        video_tensor = latent_video["samples"].clone() # Shape: [B, C, F_vid, H, W]
-        ref_tensor = reference_face["samples"].clone() # Shape: [B, C, F_ref, H, W]
+    def inject_context(self, latent_video, reference_image, scaling_correction):
+        # 1. Capture the shape parameters of your main video latent matrix
+        video_tensor = latent_video["samples"].clone() # Shape: [B, C, F_vid, H_vid, W_vid]
+        B, C, F_vid, H_vid, W_vid = video_tensor.shape
         
-        B, C, F_vid, H, W = video_tensor.shape
+        ref_img = reference_image.clone()
         
-        # 1. Scaling correction for LTX latent space distribution 
+        # 2. Match pixel dimensions for LTX-2.3's 8x downsampler
+        target_h_pixels = H_vid * 8
+        target_w_pixels = W_vid * 8
+        
+        ref_img = ref_img.permute(0, 3, 1, 2) # [B, H, W, C] -> [B, C, H, W]
+        if ref_img.shape[-2:] != (target_h_pixels, target_w_pixels):
+            ref_img = F.interpolate(ref_img, size=(target_h_pixels, target_w_pixels), mode="bilinear", align_corners=False)
+        
+        # 3. Shape the reference image down directly into the structural resolution of the video
+        ref_latent = F.interpolate(ref_img, size=(H_vid, W_vid), mode="bilinear", align_corners=False)
+        
+        if ref_latent.shape[1] != C:
+            ref_latent = ref_latent.repeat(1, C // ref_latent.shape[1] + 1, 1, 1)[:, :C, :, :]
+            
+        ref_tensor = ref_latent.unsqueeze(2) # Shapes out perfectly to [B, C, 1, H_vid, W_vid]
+
         if scaling_correction:
-            if torch.std(ref_tensor).item() < 0.5: 
-                ref_tensor = ref_tensor / 0.18215
+            ref_tensor = ref_tensor * 0.18215
 
-        # 2. Synchronize spatial coordinates via bilinear interpolation if mismatched
-        if ref_tensor.shape[-2:] != (H, W):
-            ref_flat = ref_tensor.squeeze(2) if ref_tensor.dim() == 5 else ref_tensor
-            ref_resized = F.interpolate(ref_flat, size=(H, W), mode="bilinear")
-            ref_tensor = ref_resized.unsqueeze(2) if ref_tensor.dim() == 5 else ref_resized.unsqueeze(1).transpose(1,2)
-
-        # 3. Concatenate reference frames directly onto the temporal (F) axis
+        # 4. Concatenate video latents cleanly
         extended_samples = torch.cat([ref_tensor, video_tensor], dim=2) 
         reference_frames = ref_tensor.shape[2]
 
@@ -43,10 +54,27 @@ class STDRCContextInjector:
             "type": "video"
         }
         
-        # Build matching zero-denoise noise mask for the prefix frames if a video mask exists
+        # 5. FIXED: Dynamic, Error-Resilient Noise Mask Concatenation
         if "noise_mask" in latent_video:
             orig_mask = latent_video["noise_mask"].clone()
-            ref_mask = torch.zeros((B, 1, reference_frames, H, W), device=video_tensor.device, dtype=video_tensor.dtype)
+            
+            # Dynamically normalize orig_mask dimensions to match 5D layout [B, C, F, H, W]
+            # to prevent shape crashes regardless of how upstream nodes built it
+            if orig_mask.dim() == 3: # [F, H, W]
+                orig_mask = orig_mask.unsqueeze(0).unsqueeze(0)
+            elif orig_mask.dim() == 4: # [B, F, H, W] or [C, F, H, W]
+                orig_mask = orig_mask.unsqueeze(1)
+                
+            mask_B, mask_C, mask_F, mask_H, mask_W = orig_mask.shape
+            
+            # Build the reference freeze mask using the target mask's exact data layout profile (C will be 1)
+            ref_mask = torch.zeros(
+                (mask_B, mask_C, reference_frames, mask_H, mask_W), 
+                device=video_tensor.device, 
+                dtype=video_tensor.dtype
+            )
+            
+            # Stitch them together cleanly along the temporal framework (dim=2)
             new_latent_dict["noise_mask"] = torch.cat([ref_mask, orig_mask], dim=2)
 
         return (new_latent_dict, reference_frames)
@@ -146,9 +174,14 @@ class TASSRoPEPatcher:
             return q_patched, k_patched, v
 
         # We inject our patch function directly into ComfyUI's native self-attention calculation block
-        patched_model.set_model_attn_1_patch(tass_rope_attention_patch)
+        patched_model.set_model_attn1_patch(tass_rope_attention_patch)
         
         return (patched_model,)
+
+
+import torch
+import random
+import comfy.samplers
 
 class STDRCThreeStreamGuider:
     @classmethod
@@ -168,47 +201,116 @@ class STDRCThreeStreamGuider:
     FUNCTION = "setup_guider"
     CATEGORY = "ST-DRC/Sampling"
 
+    @classmethod
+    def IS_CHANGED(s, **kwargs):
+        """Bypasses stale graph caching to ensure changes evaluate dynamically."""
+        return random.random()
+
     def setup_guider(self, model, positive_text, positive_reference, negative, cfg, reference_scale):
-        # We define an internal custom guider class that ComfyUI's SamplerCustomAdvanced can read natively
-        class ThreeStreamGuider:
-            def __init__(self, model, pos_text, pos_ref, neg, cfg_scale, ref_scale):
-                self.model = model
+        
+        # Standalone implementation class satisfying ComfyUI's Guider type constraints
+        class ThreeStreamGuider(object):
+            def __init__(self, model_patcher):
+                # Core structural properties required by nodes_custom_sampler.py
+                self.model_patcher = model_patcher
+                self.inner_model = model_patcher.model
+                
+                self.pos_text = None
+                self.pos_ref = None
+                self.neg = None
+                self.cfg_scale = 1.0
+                self.ref_scale = 1.0
+
+            def set_conds(self, pos_text, pos_ref, neg, cfg_scale, ref_scale):
                 self.pos_text = pos_text
                 self.pos_ref = pos_ref
                 self.neg = neg
                 self.cfg_scale = cfg_scale
                 self.ref_scale = ref_scale
 
-            def __call__(self, x, timestep, **kwargs):
-                # This inner function executes at every single denoising step
-                # x is the current noisy latent tensor string
+            def sample(self, noise, latent_image, sampler, sigmas, denoise_mask=None, callback=None, disable_pbar=False, seed=None):
+                """
+                Standardized custom sampler entryway mapping compute targets directly.
+                """
+                # Resolve the target GPU/CPU execution device from the active model patcher
+                compute_device = getattr(self.model_patcher, "load_device", None)
+                if compute_device is None:
+                    compute_device = getattr(self.model_patcher, "current_device", torch.device("cuda"))
+
+                return comfy.samplers.sample(
+                    model=self.model_patcher,
+                    noise=noise,
+                    positive=self.pos_text, 
+                    negative=self.neg,
+                    cfg=1.0, # Multi-stream arithmetic overrides standard scaling calculation paths below
+                    latent_image=latent_image,
+                    sampler=sampler,
+                    sigmas=sigmas,
+                    denoise_mask=denoise_mask,
+                    callback=callback,
+                    disable_pbar=disable_pbar,
+                    seed=seed,
+                    device=compute_device # Fulfills the missing positional requirement
+                )
+
+            def predict_noise(self, x, timestep, model_options={}, seed=None):
+                """
+                Isolated multi-stream guidance computation path.
+                """
+                options_clean = model_options.copy()
+
+                # --- TRACK 1: TEXT DIRECTION ---
+                out_text = comfy.samplers.calc_cond_batch(
+                    model=self.model_patcher,
+                    conds=self.pos_text,
+                    x_in=x,
+                    timestep=timestep,
+                    model_options=options_clean
+                )
+
+                # --- TRACK 2: REFERENCE DIRECTION ---
+                out_ref = comfy.samplers.calc_cond_batch(
+                    model=self.model_patcher,
+                    conds=self.pos_ref,
+                    x_in=x,
+                    timestep=timestep,
+                    model_options=options_clean
+                )
+
+                # --- TRACK 3: UNCONDITIONAL NOISE ---
+                out_neg = comfy.samplers.calc_cond_batch(
+                    model=self.model_patcher,
+                    conds=self.neg,
+                    x_in=x,
+                    timestep=timestep,
+                    model_options=options_clean
+                )
                 
-                # 1. Run model prediction across all three conditional embedding targets
-                # We fetch velocity or noise predictions by passing each conditioning branch
-                out_text = self.model.apply_model(x, timestep, cond=self.pos_text, **kwargs)
-                out_ref = self.model.apply_model(x, timestep, cond=self.pos_ref, **kwargs)
-                out_neg = self.model.apply_model(x, timestep, cond=self.neg, **kwargs)
-                
-                # 2. Extract the mathematical direction vectors
-                # Vector component pulling toward text alignment
+                # Derive velocity trajectory vectors
                 text_direction = out_text - out_neg
-                
-                # Vector component pulling toward identity reference alignment
                 ref_direction = out_ref - out_neg
                 
-                # 3. Recombine using independent scaling variables matching the ST-DRC paper
-                # Base Unconditional Noise + (Text_Scale * Text_Vector) + (Ref_Scale * Ref_Vector)
+                # Combine using ST-DRC multi-stream scaling coefficients
                 final_velocity = out_neg + (self.cfg_scale * text_direction) + (self.ref_scale * ref_direction)
                 
                 return final_velocity
 
             def clone(self):
-                return ThreeStreamGuider(self.model, self.pos_text, self.pos_ref, self.neg, self.cfg_scale, self.ref_scale)
+                c = ThreeStreamGuider(self.model_patcher)
+                c.set_conds(self.pos_text, self.pos_ref, self.neg, self.cfg_scale, self.ref_scale)
+                return c
 
-        # Instantiate our custom guider class and wrap it inside the standard ComfyUI structure
-        guider_instance = ThreeStreamGuider(model, positive_text, positive_reference, negative, cfg, reference_scale)
+        guider_instance = ThreeStreamGuider(model)
+        guider_instance.set_conds(positive_text, positive_reference, negative, cfg, reference_scale)
+        
+        # Inject our custom class instance directly into the model's tracking layer.
+        if "model_options" not in model.model_options:
+            model.model_options["model_options"] = {}
+        
+        model.model_options["model_options"]["transformer_options"] = model.model_options.get("transformer_options", {})
         
         return (guider_instance,)
+
 
 class STDRCLatentTrimmer:
     @classmethod
@@ -244,8 +346,6 @@ class STDRCLatentTrimmer:
 
         return (new_latent_dict,)
 
-
-# --- STRICT ST-DRC REGISTRATION MAPPINGS ---
 
 # --- STRICT ST-DRC REGISTRATION MAPPINGS ---
 
