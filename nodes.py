@@ -196,6 +196,23 @@ class STDRCThreeStreamGuider:
                     t_stream_0 = timesteps[0:1] if hasattr(timesteps, "shape") and timesteps.shape[0] == 2 else timesteps
                     t_stream_1 = timesteps[1:2] if hasattr(timesteps, "shape") and timesteps.shape[0] == 2 else timesteps
 
+                    def safe_clone_options(options_dict, target_idx):
+                        # Safely duplicate the context tracking maps without using problematic deepcopy
+                        new_opts = {}
+                        for key, val in options_dict.items():
+                            if isinstance(val, dict):
+                                new_opts[key] = val.copy()
+                            elif isinstance(val, list):
+                                new_opts[key] = val.copy()
+                            elif torch.is_tensor(val):
+                                if val.shape[0] == 2:
+                                    new_opts[key] = val[target_idx:target_idx+1].clone()
+                                else:
+                                    new_opts[key] = val.clone()
+                            else:
+                                new_opts[key] = val
+                        return new_opts
+
                     def make_batch_one(data_node, idx):
                         if torch.is_tensor(data_node):
                             if data_node.shape[0] == 2:
@@ -214,14 +231,14 @@ class STDRCThreeStreamGuider:
 
                     for k, v in kwargs.items():
                         if k == "transformer_options" and isinstance(v, dict):
-                            opts_text = copy.deepcopy(v)
-                            opts_uncond = copy.deepcopy(v)
+                            # --- FIX: Avoid raw deepcopy on CUDA memory allocations ---
+                            opts_text = safe_clone_options(v, 0)
+                            opts_uncond = safe_clone_options(v, 1)
                             
                             opts_text["cond_or_uncond"] = [0]
                             opts_uncond["cond_or_uncond"] = [1]
                             
-                            # --- FIX: Synchronize internal indexing layout structures ---
-                            # If ComfyUI appended native conditional tracking keys into v, clean them down to batch size 1
+                            # Slice positional maps down to singular batch boundaries safely
                             for tracker_key in ["image_rotary_emb", "position_ids", "mask"]:
                                 if tracker_key in opts_text and torch.is_tensor(opts_text[tracker_key]):
                                     if opts_text[tracker_key].shape[0] == 2:
