@@ -255,4 +255,81 @@ class STDRCThreeStreamGuider:
                         text_direction = out_text - out_neg
                         ref_direction = out_ref - out_neg
                         mixed_vector = out_neg + (self.cfg_scale * text_direction) + (self.ref_scale * ref_direction)
-                        return torch.cat(
+                        return torch.cat([mixed_vector, mixed_vector], dim=0)
+
+                target_model.forward = custom_dit_forward
+
+                try:
+                    return comfy.samplers.sample(
+                        model=self.model_patcher,
+                        noise=noise,
+                        positive=self.pos_text, 
+                        negative=self.neg,
+                        cfg=1.0, 
+                        latent_image=latent_image,
+                        sampler=sampler,
+                        sigmas=sigmas,
+                        denoise_mask=denoise_mask,
+                        callback=callback,
+                        disable_pbar=disable_pbar,
+                        seed=seed,
+                        device=compute_device
+                    )
+                finally:
+                    target_model.forward = original_forward
+
+            def predict_noise(self, x, timestep, model_options={}, seed=None):
+                return x
+
+            def clone(self):
+                return ThreeStreamGuider(self.model_patcher)
+
+        guance_instance = ThreeStreamGuider(model_patched)
+        return (guance_instance,)
+
+
+class STDRCLatentTrimmer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "extended_latent": ("LATENT",),
+                "reference_frames": ("INT", {"default": 1, "min": 1, "max": 64}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("trimmed_latent",)
+    FUNCTION = "trim_context"
+    CATEGORY = "ST-DRC/Post-Processing"
+
+    def trim_context(self, extended_latent, reference_frames):
+        samples = extended_latent["samples"].clone()
+        
+        trimmed_samples = samples[:, :, :-reference_frames, :, :]
+        
+        new_latent_dict = {
+            "samples": trimmed_samples,
+            "type": "video"
+        }
+        
+        if "noise_mask" in extended_latent:
+            orig_mask = extended_latent["noise_mask"]
+            new_latent_dict["noise_mask"] = orig_mask[:, :, :-reference_frames, :, :]
+
+        return (new_latent_dict,)
+
+
+NODE_CLASS_MAPPINGS = {
+    "STDRCContextInjector": STDRCContextInjector,
+    "TASSRoPEPatcher": TASSRoPEPatcher,
+    "STDRCThreeStreamGuider": STDRCThreeStreamGuider,
+    "STDRCLatentTrimmer": STDRCLatentTrimmer, 
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "STDRCContextInjector": "ST-DRC Context Latent Injector (Pine)",
+    "TASSRoPEPatcher": "ST-DRC TASS-RoPE Patcher (Pine)",
+    "STDRCThreeStreamGuider": "ST-DRC CFG Guider (Pine)",
+    "STDRCLatentTrimmer": "ST-DRC Latent Trimmer (Pine)",
+}
