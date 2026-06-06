@@ -22,13 +22,11 @@ class STDRCContextInjector:
     CATEGORY = "ST-DRC/Preparation"
 
     def inject_context(self, latent_video, reference_image, scaling_correction):
-        # 1. Capture the shape parameters of your main video latent matrix
         video_tensor = latent_video["samples"].clone() # Shape: [B, C, F_vid, H_vid, W_vid]
         B, C, F_vid, H_vid, W_vid = video_tensor.shape
         
         ref_img = reference_image.clone()
         
-        # 2. Match pixel dimensions for LTX-2.3's 8x downsampler
         target_h_pixels = H_vid * 8
         target_w_pixels = W_vid * 8
         
@@ -36,15 +34,14 @@ class STDRCContextInjector:
         if ref_img.shape[-2:] != (target_h_pixels, target_w_pixels):
             ref_img = F.interpolate(ref_img, size=(target_h_pixels, target_w_pixels), mode="bilinear", align_corners=False)
         
-        # 3. Shape the reference image down directly into the structural resolution of the video
         ref_latent = F.interpolate(ref_img, size=(H_vid, W_vid), mode="bilinear", align_corners=False)
         
         if ref_latent.shape[1] != C:
             ref_latent = ref_latent.repeat(1, C // ref_latent.shape[1] + 1, 1, 1)[:, :C, :, :]
             
-        ref_tensor = ref_latent.unsqueeze(2) # Shapes out perfectly to [B, C, 1, H_vid, W_vid]
+        ref_tensor = ref_latent.unsqueeze(2) # [B, C, 1, H_vid, W_vid]
 
-        # --- ALIGNED WITH PAPER: Concatenate reference frames as an APPENDIX (at the END of dim=2) ---
+        # --- APPENDIX LAYOUT FROM PAPER ---
         extended_samples = torch.cat([video_tensor, ref_tensor], dim=2) 
         reference_frames = ref_tensor.shape[2]
 
@@ -53,13 +50,12 @@ class STDRCContextInjector:
             "type": "video"
         }
         
-        # 4. Dynamic, Error-Resilient Noise Mask Concatenation
         if "noise_mask" in latent_video:
             orig_mask = latent_video["noise_mask"].clone()
             
-            if orig_mask.dim() == 3: # [F, H, W]
+            if orig_mask.dim() == 3:
                 orig_mask = orig_mask.unsqueeze(0).unsqueeze(0)
-            elif orig_mask.dim() == 4: # [B, F, H, W] or [C, F, H, W]
+            elif orig_mask.dim() == 4:
                 orig_mask = orig_mask.unsqueeze(1)
                 
             mask_B, mask_C, mask_F, mask_H, mask_W = orig_mask.shape
@@ -70,7 +66,6 @@ class STDRCContextInjector:
                 dtype=video_tensor.dtype
             )
             
-            # Append reference mask to the end
             new_latent_dict["noise_mask"] = torch.cat([orig_mask, ref_mask], dim=2)
 
         return (new_latent_dict, reference_frames)
@@ -98,14 +93,18 @@ class TASSRoPEPatcher:
             seq_dim = 1
             total_tokens = q.shape[seq_dim]
             
-            # Safely calculate token dimensions per frame
-            approx_tokens_per_frame = total_tokens // (extra_options.get("original_shape", [1, 1, 96])[2] + reference_frames) if "original_shape" in extra_options else 1536
+            orig_shape = extra_options.get("original_shape", None)
+            if orig_shape is not None and len(orig_shape) >= 3:
+                total_expected_frames = orig_shape[2]
+            else:
+                total_expected_frames = 97 
+                
+            approx_tokens_per_frame = total_tokens // total_expected_frames
             ref_token_boundary = approx_tokens_per_frame * reference_frames
             
-            if ref_token_boundary >= total_tokens:
+            if ref_token_boundary >= total_tokens or ref_token_boundary <= 0:
                 return q, k, v 
                 
-            # --- FIX: SLICE FROM THE BACK SINCE REF IS APPENDED AS AN APPENDIX ---
             split_idx = total_tokens - ref_token_boundary
             
             video_q = q[:, :split_idx, :, :]
@@ -114,19 +113,16 @@ class TASSRoPEPatcher:
             video_k = k[:, :split_idx, :, :]
             ref_k = k[:, split_idx:, :, :]
 
-            # Apply TASS-RoPE Spatial-Shift Math
             spatial_shift_tensor = torch.tensor(spatial_shift, dtype=q.dtype, device=q.device)
             ref_q_shifted = ref_q * torch.cos(spatial_shift_tensor)
             ref_k_shifted = ref_k * torch.cos(spatial_shift_tensor)
 
-            # Apply Temporal-Adjacent Synchronization
             video_q_mean = video_q.mean(dim=seq_dim, keepdim=True)
             video_k_mean = video_k.mean(dim=seq_dim, keepdim=True)
             
             ref_q_final = ref_q_shifted + (video_q_mean * 0.01) 
             ref_k_final = ref_k_shifted + (video_k_mean * 0.01)
 
-            # --- FIX: RECOMBINE PRESERVING THE ORIGINAL APPENDIX POSITION ---
             q_patched = torch.cat([video_q, ref_q_final], dim=seq_dim)
             k_patched = torch.cat([video_k, ref_k_final], dim=seq_dim)
             
@@ -218,12 +214,24 @@ class STDRCThreeStreamGuider:
 
                     for k, v in kwargs.items():
                         if k == "transformer_options" and isinstance(v, dict):
-                            opts_text = v.copy()
-                            opts_uncond = v.copy()
+                            opts_text = copy.deepcopy(v)
+                            opts_uncond = copy.deepcopy(v)
+                            
                             opts_text["cond_or_uncond"] = [0]
                             opts_uncond["cond_or_uncond"] = [1]
-                            kwargs_text[k] = {nk: make_batch_one(nv, 0) for nk, nv in opts_text.items()}
-                            kwargs_uncond[k] = {nk: make_batch_one(nv, 1) for nk, nv in opts_uncond.items()}
+                            
+                            # --- FIX: Synchronize internal indexing layout structures ---
+                            # If ComfyUI appended native conditional tracking keys into v, clean them down to batch size 1
+                            for tracker_key in ["image_rotary_emb", "position_ids", "mask"]:
+                                if tracker_key in opts_text and torch.is_tensor(opts_text[tracker_key]):
+                                    if opts_text[tracker_key].shape[0] == 2:
+                                        opts_text[tracker_key] = opts_text[tracker_key][0:1]
+                                if tracker_key in opts_uncond and torch.is_tensor(opts_uncond[tracker_key]):
+                                    if opts_uncond[tracker_key].shape[0] == 2:
+                                        opts_uncond[tracker_key] = opts_uncond[tracker_key][1:2]
+                                        
+                            kwargs_text[k] = opts_text
+                            kwargs_uncond[k] = opts_uncond
                         elif torch.is_tensor(v) and v.shape[0] == 2:
                             kwargs_text[k] = v[0:1]
                             kwargs_uncond[k] = v[1:2]
@@ -247,82 +255,4 @@ class STDRCThreeStreamGuider:
                         text_direction = out_text - out_neg
                         ref_direction = out_ref - out_neg
                         mixed_vector = out_neg + (self.cfg_scale * text_direction) + (self.ref_scale * ref_direction)
-                        return torch.cat([mixed_vector, mixed_vector], dim=0)
-
-                target_model.forward = custom_dit_forward
-
-                try:
-                    return comfy.samplers.sample(
-                        model=self.model_patcher,
-                        noise=noise,
-                        positive=self.pos_text, 
-                        negative=self.neg,
-                        cfg=1.0, 
-                        latent_image=latent_image,
-                        sampler=sampler,
-                        sigmas=sigmas,
-                        denoise_mask=denoise_mask,
-                        callback=callback,
-                        disable_pbar=disable_pbar,
-                        seed=seed,
-                        device=compute_device
-                    )
-                finally:
-                    target_model.forward = original_forward
-
-            def predict_noise(self, x, timestep, model_options={}, seed=None):
-                return x
-
-            def clone(self):
-                return ThreeStreamGuider(self.model_patcher)
-
-        guance_instance = ThreeStreamGuider(model_patched)
-        return (guance_instance,)
-
-
-class STDRCLatentTrimmer:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "extended_latent": ("LATENT",),
-                "reference_frames": ("INT", {"default": 1, "min": 1, "max": 64}),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("trimmed_latent",)
-    FUNCTION = "trim_context"
-    CATEGORY = "ST-DRC/Post-Processing"
-
-    def trim_context(self, extended_latent, reference_frames):
-        samples = extended_latent["samples"].clone() # Shape: [B, C, F_total, H, W]
-        
-        # --- ALIGNED WITH PAPER: Slice off the APPENDIX frames from the END ---
-        trimmed_samples = samples[:, :, :-reference_frames, :, :]
-        
-        new_latent_dict = {
-            "samples": trimmed_samples,
-            "type": "video"
-        }
-        
-        if "noise_mask" in extended_latent:
-            orig_mask = extended_latent["noise_mask"]
-            new_latent_dict["noise_mask"] = orig_mask[:, :, :-reference_frames, :, :]
-
-        return (new_latent_dict,)
-
-
-NODE_CLASS_MAPPINGS = {
-    "STDRCContextInjector": STDRCContextInjector,
-    "TASSRoPEPatcher": TASSRoPEPatcher,
-    "STDRCThreeStreamGuider": STDRCThreeStreamGuider,
-    "STDRCLatentTrimmer": STDRCLatentTrimmer, 
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "STDRCContextInjector": "ST-DRC Context Latent Injector (Pine)",
-    "TASSRoPEPatcher": "ST-DRC TASS-RoPE Patcher (Pine)",
-    "STDRCThreeStreamGuider": "ST-DRC CFG Guider (Pine)",
-    "STDRCLatentTrimmer": "ST-DRC Latent Trimmer (Pine)",
-}
+                        return torch.cat(
