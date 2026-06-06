@@ -155,6 +155,7 @@ class STDRCThreeStreamGuider:
         return random.random()
 
     def setup_guider(self, model, positive_text, positive_reference, negative, cfg, reference_scale):
+        
         model_patched = model.clone()
 
         class ThreeStreamGuider(object):
@@ -173,18 +174,28 @@ class STDRCThreeStreamGuider:
                 if compute_device is None:
                     compute_device = getattr(self.model_patcher, "current_device", torch.device("cuda"))
 
+                upstream_rope = None
+                if "patches" in self.model_patcher.model_options and "attn1_patch" in self.model_patcher.model_options["patches"]:
+                    upstream_rope = self.model_patcher.model_options["patches"]["attn1_patch"]
+                elif "transformer_options" in self.model_patcher.model_options and "patches" in self.model_patcher.model_options["transformer_options"]:
+                    upstream_rope = self.model_patcher.model_options["transformer_options"]["patches"].get("attn1_patch", None)
+
                 has_dit = hasattr(self.inner_model, "diffusion_model")
                 target_model = self.inner_model.diffusion_model if has_dit else self.inner_model
                 original_forward = target_model.forward
 
+                # --- UNIFIED DEEP INJECTION LAYER ---
                 def custom_dit_forward(x, timesteps, context, *args, **kwargs):
+                    
                     if context.shape[0] != 2:
                         return original_forward(x, timesteps, context, *args, **kwargs)
 
+                    # 1. Isolate clean Batch 1 contexts
                     cond_text_stream = context[0:1]
                     cond_uncond_stream = context[1:2]
                     cond_ref_stream = cond_text_stream.clone() 
 
+                    # 2. Safely slice latent payload inputs
                     def slice_batch_element(input_obj, idx):
                         if isinstance(input_obj, list):
                             return [item[idx:idx+1] for item in input_obj]
@@ -196,34 +207,21 @@ class STDRCThreeStreamGuider:
                     t_stream_0 = timesteps[0:1] if hasattr(timesteps, "shape") and timesteps.shape[0] == 2 else timesteps
                     t_stream_1 = timesteps[1:2] if hasattr(timesteps, "shape") and timesteps.shape[0] == 2 else timesteps
 
-                    def safe_clone_options(options_dict, target_idx):
-                        # Safely duplicate the context tracking maps without using problematic deepcopy
-                        new_opts = {}
-                        for key, val in options_dict.items():
-                            if isinstance(val, dict):
-                                new_opts[key] = val.copy()
-                            elif isinstance(val, list):
-                                new_opts[key] = val.copy()
-                            elif torch.is_tensor(val):
-                                if val.shape[0] == 2:
-                                    new_opts[key] = val[target_idx:target_idx+1].clone()
-                                else:
-                                    new_opts[key] = val.clone()
-                            else:
-                                new_opts[key] = val
-                        return new_opts
-
-                    def make_batch_one(data_node, idx):
+                    # 3. Memory-safe recursive tensor-slicing handler (FIXED FOR LTX2.3 POOLED/TIMESTEP DIMENSIONS)
+                    def make_batch_one(data_node, idx, target_batch_size=2):
                         if torch.is_tensor(data_node):
-                            if data_node.shape[0] == 2:
+                            # Ensure we only split if it represents the explicit batch dimension.
+                            # Standard LTX pooled/timestep metrics often have shapes like [2] or 2D layouts.
+                            # We only slice if the dimension size matches the incoming batch stream and it's likely a batch dim.
+                            if data_node.shape[0] == target_batch_size and data_node.dim() > 1 and data_node.shape[1] != 1:
                                 return data_node[idx:idx+1]
                             return data_node
                         elif isinstance(data_node, list):
-                            return [make_batch_one(child, idx) for child in data_node]
+                            return [make_batch_one(child, idx, target_batch_size) for child in data_node]
                         elif isinstance(data_node, tuple):
-                            return tuple(make_batch_one(child, idx) for child in data_node)
+                            return tuple(make_batch_one(child, idx, target_batch_size) for child in data_node)
                         elif isinstance(data_node, dict):
-                            return {k: make_batch_one(v, idx) for k, v in data_node.items()}
+                            return {k: make_batch_one(v, idx, target_batch_size) for k, v in data_node.items()}
                         return data_node
 
                     kwargs_text = {}
@@ -231,35 +229,29 @@ class STDRCThreeStreamGuider:
 
                     for k, v in kwargs.items():
                         if k == "transformer_options" and isinstance(v, dict):
-                            # --- FIX: Avoid raw deepcopy on CUDA memory allocations ---
-                            opts_text = safe_clone_options(v, 0)
-                            opts_uncond = safe_clone_options(v, 1)
+                            opts_text = v.copy()
+                            opts_uncond = v.copy()
                             
                             opts_text["cond_or_uncond"] = [0]
                             opts_uncond["cond_or_uncond"] = [1]
                             
-                            # Slice positional maps down to singular batch boundaries safely
-                            for tracker_key in ["image_rotary_emb", "position_ids", "mask"]:
-                                if tracker_key in opts_text and torch.is_tensor(opts_text[tracker_key]):
-                                    if opts_text[tracker_key].shape[0] == 2:
-                                        opts_text[tracker_key] = opts_text[tracker_key][0:1]
-                                if tracker_key in opts_uncond and torch.is_tensor(opts_uncond[tracker_key]):
-                                    if opts_uncond[tracker_key].shape[0] == 2:
-                                        opts_uncond[tracker_key] = opts_uncond[tracker_key][1:2]
-                                        
-                            kwargs_text[k] = opts_text
-                            kwargs_uncond[k] = opts_uncond
-                        elif torch.is_tensor(v) and v.shape[0] == 2:
+                            kwargs_text[k] = {nk: make_batch_one(nv, 0, 2) for nk, nv in opts_text.items()}
+                            kwargs_uncond[k] = {nk: make_batch_one(nv, 1, 2) for nk, nv in opts_uncond.items()}
+                        
+                        # FIX: Explicit verification for true batch tensors (like pooled conditioning)
+                        elif torch.is_tensor(v) and v.shape[0] == 2 and v.dim() > 1:
                             kwargs_text[k] = v[0:1]
                             kwargs_uncond[k] = v[1:2]
                         else:
-                            kwargs_text[k] = make_batch_one(v, 0)
-                            kwargs_uncond[k] = make_batch_one(v, 1)
+                            kwargs_text[k] = make_batch_one(v, 0, 2)
+                            kwargs_uncond[k] = make_batch_one(v, 1, 2)
 
+                    # --- EXECUTE PURE ISOLATED BATCH-1 PASSES ---
                     out_text = original_forward(x_stream_cond, t_stream_0, cond_text_stream, *args, **kwargs_text)
                     out_ref = original_forward(x_stream_cond, t_stream_0, cond_ref_stream, *args, **kwargs_text)
                     out_neg = original_forward(x_stream_uncond, t_stream_1, cond_uncond_stream, *args, **kwargs_uncond)
 
+                    # 4. Perform vector recombination across aligned frame tracks
                     if isinstance(out_text, list):
                         final_output = []
                         for i in range(len(out_text)):
@@ -299,10 +291,11 @@ class STDRCThreeStreamGuider:
                 return x
 
             def clone(self):
-                return ThreeStreamGuider(self.model_patcher)
+                c = ThreeStreamGuider(self.model_patcher)
+                return c
 
-        guance_instance = ThreeStreamGuider(model_patched)
-        return (guance_instance,)
+        guider_instance = ThreeStreamGuider(model_patched)
+        return (guider_instance,)
 
 
 class STDRCLatentTrimmer:
