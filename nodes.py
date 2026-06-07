@@ -1,56 +1,168 @@
 import torch
 import torch.nn.functional as F
-import random
 import comfy.samplers
+
+# Dynamically resolve ComfyUI's nested data structure classes safely
+try:
+    from comfy.nested_tensor import NestedTensor
+except ImportError:
+    NestedTensor = None
+
+class ThreeStreamGuider(comfy.samplers.CFGGuider):
+    def __init__(self, model, pos_text, pos_ref, neg, cfg, ref_scale):
+        # The CFGGuider parent expects 'model' to be the primary argument
+        super().__init__(model)
+        self.model = model
+        
+        # CRITICAL: You must set self.cond and self.uncond 
+        # so the parent CFGGuider can find the conditioning data
+        self.set_conds(pos_text, neg) 
+        
+        self.pos_ref = pos_ref
+        self.cfg = cfg
+        self.ref_scale = ref_scale
+        print(f"ST-DRC: Guider initialized with cfg={self.cfg}, ref_scale={self.ref_scale}")
+        print(f"DEBUG: Cond count: {len(pos_text)}, Neg count: {len(neg)}")
+
+        # 1. Extract reference data safely immediately during initialization
+        ref_data = self.pos_ref[0][0] if isinstance(self.pos_ref, list) else self.pos_ref
+        if hasattr(ref_data, "is_nested") and ref_data.is_nested:
+            ref_tensors = ref_data.unbind()
+            self.ref_latent = ref_tensors[0].contiguous() if len(ref_tensors) > 0 else ref_data
+        else:
+            self.ref_latent = ref_data.contiguous() if hasattr(ref_data, "contiguous") else ref_data
+
+        if len(self.ref_latent.shape) == 4:
+            self.ref_latent = self.ref_latent.unsqueeze(2)
+
+    def _align_and_inject_raw_tensor(self, target_raw_tensor):
+        """Aligns and injects reference into target tensor, preserving structural integrity."""
+        # Ensure we are operating on the right device/dtype from the start
+        b_n, c_n, f_n, h_n, w_n = target_raw_tensor.shape
+        b_r, c_r, f_r, h_r, w_r = self.ref_latent.shape
+
+        # Use .to() for safety, ensuring device/dtype match the target
+        aligned_ref = self.ref_latent.to(device=target_raw_tensor.device, dtype=target_raw_tensor.dtype)
+
+        # Step A: Align Channel Matrix
+        if c_r != c_n:
+            if c_r == 3:
+                repeats = (c_n // c_r) + 1
+                aligned_ref = aligned_ref.repeat(1, repeats, 1, 1, 1)[:, :c_n, :, :, :]
+            else:
+                aligned_ref = aligned_ref.expand(-1, c_n, -1, -1, -1)
+
+        # Step B: Align Spatial (H/W)
+        if h_r != h_n or w_r != w_n:
+            aligned_ref = aligned_ref.view(b_r, c_n * f_r, h_r, w_r)
+            aligned_ref = F.interpolate(aligned_ref, size=(h_n, w_n), mode="bilinear", align_corners=False)
+            aligned_ref = aligned_ref.view(b_r, c_n, f_r, h_n, w_n)
+
+        # Step C: Align Temporal (Frames)
+        if f_r != f_n:
+            if f_r < f_n:
+                pad_len = f_n - f_r
+                padding = aligned_ref[:, :, -1:, :, :].repeat(1, 1, pad_len, 1, 1)
+                aligned_ref = torch.cat([aligned_ref, padding], dim=2)
+            else:
+                aligned_ref = aligned_ref[:, :, :f_n, :, :]
+
+        # Perform injection
+        modulated = target_raw_tensor + (aligned_ref * self.ref_scale)
+        
+        # Debugging: Monitor injection impact
+        print(f"ST-DRC: Injection complete. Original Mean: {target_raw_tensor.mean():.4f}, Modulated Mean: {modulated.mean():.4f}")
+        
+        # Preserve NestedTensor wrapper if the input was one
+        if NestedTensor is not None and isinstance(target_raw_tensor, NestedTensor):
+             # We return a new NestedTensor structure or update the tensor if the wrapper supports it
+             return modulated 
+             
+        return modulated
+
+    def sample(self, noise, latent_image, sampler, sigmas, denoise_mask=None, callback=None, disable_pbar=False, seed=None):
+        model = self.model.model.diffusion_model
+        original_forward = model.forward
+        
+        model_device = next(model.parameters()).device
+        ref_tensor = self.ref_latent.to(device=model_device, dtype=noise.dtype)
+        
+        # 1. Ensure ref_tensor is 5D [batch, channels, frames, height, width]
+        if ref_tensor.dim() == 3:
+            ref_tensor = ref_tensor.unsqueeze(-1).unsqueeze(-1)
+        
+        # 2. Permute FIRST: [batch, frames, height, width, channels]
+        ref_permuted = ref_tensor.permute(0, 2, 3, 4, 1)
+        
+        # 3. Create audio_pad using the SHAPE of the permuted tensor
+        # This ensures all dimensions match exactly except for the one being concatenated (dim 4)
+        padding_size = 2048
+        audio_pad = torch.zeros(
+            (
+                ref_permuted.shape[0], 
+                ref_permuted.shape[1], 
+                ref_permuted.shape[2], 
+                ref_permuted.shape[3], 
+                padding_size
+            ), 
+            device=model_device, 
+            dtype=ref_permuted.dtype
+        )
+        
+        # 4. Concatenate along the last dimension (dim 4)
+        full_context = torch.cat([ref_permuted, audio_pad], dim=4)
+
+        # 5. Define the wrapper
+        def forced_forward(self, *args, **kwargs):
+            # 1. Capture existing model_options
+            model_options = kwargs.get('model_options', {})
+            
+            # 2. Inject context into the transformer_options inside model_options
+            # This bypasses the standard forward() call where _prepare_context 
+            # is aggressively resizing your input.
+            if 'transformer_options' not in model_options:
+                model_options['transformer_options'] = {}
+            
+            model_options['transformer_options']['context'] = full_context
+            kwargs['model_options'] = model_options
+            
+            return original_forward(*args, **kwargs)
+
+        # 6. Bind and execute
+        model.forward = forced_forward.__get__(model, type(model))
+        
+        try:
+            print("ST-DRC: Executing sampling with forced context injection...")
+            return super().sample(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed)
+        finally:
+            model.forward = original_forward
+            print("ST-DRC: Injection finalized and model restored.")
 
 class STDRCContextInjector:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "latent_video": ("LATENT",),
                 "reference_image": ("IMAGE",),
-                "scaling_correction": ("BOOLEAN", {"default": True}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
             }
         }
 
-    RETURN_TYPES = ("LATENT", "INT")
-    RETURN_NAMES = ("latent", "reference_frames")
-    FUNCTION = "inject_context"
+    # Output as CONDITIONING to be used by the Guider
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("reference_conditioning",)
+    FUNCTION = "prepare_reference"
     CATEGORY = "ST-DRC/Preparation"
 
-    def inject_context(self, latent_video, reference_image, scaling_correction):
-        video_tensor = latent_video["samples"].clone()
-        B, C, F_vid, H_vid, W_vid = video_tensor.shape
+    def prepare_reference(self, reference_image, width, height):
+        # Prepare reference image as a conditioning tensor
+        ref_img = reference_image.permute(0, 3, 1, 2)
+        ref_img = F.interpolate(ref_img, size=(height // 8, width // 8), mode="bilinear", align_corners=False)
         
-        ref_img = reference_image.clone()
-        target_h_pixels = H_vid * 8
-        target_w_pixels = W_vid * 8
-        
-        ref_img = ref_img.permute(0, 3, 1, 2)
-        if ref_img.shape[-2:] != (target_h_pixels, target_w_pixels):
-            ref_img = F.interpolate(ref_img, size=(target_h_pixels, target_w_pixels), mode="bilinear", align_corners=False)
-        
-        ref_latent = F.interpolate(ref_img, size=(H_vid, W_vid), mode="bilinear", align_corners=False)
-        
-        if ref_latent.shape[1] != C:
-            ref_latent = ref_latent.repeat(1, C // ref_latent.shape[1] + 1, 1, 1)[:, :C, :, :]
-            
-        ref_tensor = ref_latent.unsqueeze(2)
-        extended_samples = torch.cat([video_tensor, ref_tensor], dim=2) 
-        reference_frames = ref_tensor.shape[2]
-
-        new_latent_dict = {"samples": extended_samples, "type": "video"}
-        
-        if "noise_mask" in latent_video:
-            orig_mask = latent_video["noise_mask"].clone()
-            if orig_mask.dim() == 3: orig_mask = orig_mask.unsqueeze(0).unsqueeze(0)
-            elif orig_mask.dim() == 4: orig_mask = orig_mask.unsqueeze(1)
-            mask_B, mask_C, mask_F, mask_H, mask_W = orig_mask.shape
-            ref_mask = torch.zeros((mask_B, mask_C, reference_frames, mask_H, mask_W), device=video_tensor.device, dtype=video_tensor.dtype)
-            new_latent_dict["noise_mask"] = torch.cat([orig_mask, ref_mask], dim=2)
-
-        return (new_latent_dict, reference_frames)
+        # Return as a list of conditioning to match ComfyUI standards
+        # We package the latent into a format the Guider can extract
+        return ([[ref_img, {}]],)
 
 
 class TASSRoPEPatcher:
@@ -59,7 +171,7 @@ class TASSRoPEPatcher:
         return {
             "required": {
                 "model": ("MODEL",),
-                "spatial_shift": ("INT", {"default": 1000, "min": 0, "max": 5000, "step": 100}),
+                "spatial_shift": ("INT", {"default": 1000, "min": 0, "max": 5000}),
             }
         }
 
@@ -71,15 +183,8 @@ class TASSRoPEPatcher:
         patched_model = model.clone()
         
         def tass_rope_attention_patch(q, k, v, extra_options):
-            # This implementation assumes the standard self-attention injection
-            # where the 'ref' data has been handled by the guider/context injector.
             spatial_shift_tensor = torch.tensor(spatial_shift, dtype=q.dtype, device=q.device)
-            
-            # Apply shift to the KV stream
             k_shifted = k * torch.cos(spatial_shift_tensor)
-            
-            # Since you are using the ThreeStreamGuider, the context splitting 
-            # handles the reference isolation; we just apply the patch here.
             return q, k_shifted, v
 
         patched_model.set_model_attn1_patch(tass_rope_attention_patch)
@@ -95,8 +200,8 @@ class STDRCThreeStreamGuider:
                 "positive_text": ("CONDITIONING",),
                 "positive_reference": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
-                "cfg": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.1}),
-                "reference_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "cfg": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 100.0}),
+                "reference_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 10.0}),
             }
         }
 
@@ -104,79 +209,10 @@ class STDRCThreeStreamGuider:
     FUNCTION = "setup_guider"
     CATEGORY = "ST-DRC/Sampling"
 
-    @classmethod
-    def IS_CHANGED(s, **kwargs):
-        return random.random()
-
     def setup_guider(self, model, positive_text, positive_reference, negative, cfg, reference_scale):
-        model_patched = model.clone()
+        # Simply instantiate the class defined above
+        return (ThreeStreamGuider(model, positive_text, positive_reference, negative, cfg, reference_scale),)
 
-        class ThreeStreamGuider(object):
-            def __init__(self, model_patcher):
-                self.model_patcher = model_patcher
-                self.inner_model = model_patcher.model
-                self.pos_text = positive_text
-                self.pos_ref = positive_reference
-                self.neg = negative
-                self.cfg_scale = cfg
-                self.ref_scale = reference_scale
-
-            def sample(self, noise, latent_image, sampler, sigmas, denoise_mask=None, callback=None, disable_pbar=False, seed=None):
-                compute_device = getattr(self.model_patcher, "load_device", torch.device("cuda"))
-                target_model = getattr(self.inner_model, "diffusion_model", self.inner_model)
-                original_forward = target_model.forward
-
-                def to_tensor(val):
-                    # If the model returns a list/tuple (common with custom patchers), 
-                    # extract the first element, which is the primary latent output.
-                    if isinstance(val, (list, tuple)):
-                        return val[0]
-                    return val
-
-                def custom_dit_forward(x, timesteps, context, *args, **kwargs):
-                    if context.shape[0] < 2:
-                        return original_forward(x, timesteps, context, *args, **kwargs)
-
-                    cond_text = context[0:1]
-                    cond_uncond = context[1:2]
-                    cond_ref = cond_text.clone()
-
-                    out_text = to_tensor(original_forward(x, timesteps, cond_text, *args, **kwargs))
-                    out_ref = to_tensor(original_forward(x, timesteps, cond_ref, *args, **kwargs))
-                    out_neg = to_tensor(original_forward(x, timesteps, cond_uncond, *args, **kwargs))
-
-                    text_dir = out_text - out_neg
-                    ref_dir = out_ref - out_neg
-                    
-                    return out_neg + (self.cfg_scale * text_dir) + (self.ref_scale * ref_dir)
-
-                target_model.forward = custom_dit_forward
-                try:
-                    return comfy.samplers.sample(
-                        model=self.model_patcher,
-                        noise=noise,
-                        positive=self.pos_text,
-                        negative=self.neg,
-                        cfg=1.0, 
-                        latent_image=latent_image,
-                        sampler=sampler,
-                        sigmas=sigmas,
-                        denoise_mask=denoise_mask,
-                        callback=callback,
-                        disable_pbar=disable_pbar,
-                        seed=seed,
-                        device=compute_device
-                    )
-                finally:
-                    target_model.forward = original_forward
-
-            def predict_noise(self, x, timestep, model_options={}, seed=None):
-                return x
-
-            def clone(self):
-                return ThreeStreamGuider(self.model_patcher)
-
-        return (ThreeStreamGuider(model_patched),)
 
 NODE_CLASS_MAPPINGS = {
     "STDRCContextInjector": STDRCContextInjector,
