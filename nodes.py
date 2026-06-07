@@ -21,8 +21,8 @@ class ThreeStreamGuider(comfy.samplers.CFGGuider):
         self.pos_ref = pos_ref
         self.cfg = cfg
         self.ref_scale = ref_scale
-        print(f"ST-DRC: Guider initialized with cfg={self.cfg}, ref_scale={self.ref_scale}")
-        print(f"DEBUG: Cond count: {len(pos_text)}, Neg count: {len(neg)}")
+        #print(f"ST-DRC: Guider initialized with cfg={self.cfg}, ref_scale={self.ref_scale}")
+        #print(f"ST-DRC: Cond count: {len(pos_text)}, Neg count: {len(neg)}")
 
         # 1. Extract reference data safely immediately during initialization
         ref_data = self.pos_ref[0][0] if isinstance(self.pos_ref, list) else self.pos_ref
@@ -71,7 +71,7 @@ class ThreeStreamGuider(comfy.samplers.CFGGuider):
         modulated = target_raw_tensor + (aligned_ref * self.ref_scale)
         
         # Debugging: Monitor injection impact
-        print(f"ST-DRC: Injection complete. Original Mean: {target_raw_tensor.mean():.4f}, Modulated Mean: {modulated.mean():.4f}")
+        #print(f"ST-DRC: Injection complete. Original Mean: {target_raw_tensor.mean():.4f}, Modulated Mean: {modulated.mean():.4f}")
         
         # Preserve NestedTensor wrapper if the input was one
         if NestedTensor is not None and isinstance(target_raw_tensor, NestedTensor):
@@ -84,59 +84,47 @@ class ThreeStreamGuider(comfy.samplers.CFGGuider):
         model = self.model.model.diffusion_model
         original_forward = model.forward
         
+        # 1. CAPTURE the scale here in the local scope
+        current_ref_scale = self.ref_scale 
+        
         model_device = next(model.parameters()).device
         ref_tensor = self.ref_latent.to(device=model_device, dtype=noise.dtype)
         
-        # 1. Ensure ref_tensor is 5D [batch, channels, frames, height, width]
-        if ref_tensor.dim() == 3:
-            ref_tensor = ref_tensor.unsqueeze(-1).unsqueeze(-1)
-        
-        # 2. Permute FIRST: [batch, frames, height, width, channels]
+        # ... (keep your existing ref_permuted and full_context logic) ...
         ref_permuted = ref_tensor.permute(0, 2, 3, 4, 1)
-        
-        # 3. Create audio_pad using the SHAPE of the permuted tensor
-        # This ensures all dimensions match exactly except for the one being concatenated (dim 4)
         padding_size = 2048
-        audio_pad = torch.zeros(
-            (
-                ref_permuted.shape[0], 
-                ref_permuted.shape[1], 
-                ref_permuted.shape[2], 
-                ref_permuted.shape[3], 
-                padding_size
-            ), 
-            device=model_device, 
-            dtype=ref_permuted.dtype
-        )
-        
-        # 4. Concatenate along the last dimension (dim 4)
+        audio_pad = torch.zeros((ref_permuted.shape[0], ref_permuted.shape[1], ref_permuted.shape[2], ref_permuted.shape[3], padding_size), device=model_device, dtype=ref_permuted.dtype)
         full_context = torch.cat([ref_permuted, audio_pad], dim=4)
 
-        # 5. Define the wrapper
-        def forced_forward(self, *args, **kwargs):
-            # 1. Capture existing model_options
+        # 2. Define the wrapper using the captured variable
+        def forced_forward(model_self, *args, **kwargs):
             model_options = kwargs.get('model_options', {})
+            t_options = model_options.get('transformer_options', {})
+            base_context = t_options.get('context', None)
             
-            # 2. Inject context into the transformer_options inside model_options
-            # This bypasses the standard forward() call where _prepare_context 
-            # is aggressively resizing your input.
+            # Use the captured variable, not 'self'
+            alpha = min(current_ref_scale / 10.0, 1.0) 
+            
+            if base_context is not None and base_context.shape == full_context.shape:
+                injected_context = (alpha * full_context) + ((1 - alpha) * base_context)
+            else:
+                injected_context = full_context
+
             if 'transformer_options' not in model_options:
                 model_options['transformer_options'] = {}
             
-            model_options['transformer_options']['context'] = full_context
+            model_options['transformer_options']['context'] = injected_context
             kwargs['model_options'] = model_options
             
             return original_forward(*args, **kwargs)
 
-        # 6. Bind and execute
+        # 3. Bind
         model.forward = forced_forward.__get__(model, type(model))
         
         try:
-            print("ST-DRC: Executing sampling with forced context injection...")
             return super().sample(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed)
         finally:
             model.forward = original_forward
-            print("ST-DRC: Injection finalized and model restored.")
 
 class STDRCContextInjector:
     @classmethod
